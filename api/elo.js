@@ -4,7 +4,7 @@ const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
 module.exports = async (req, res) => {
   try {
-    // Nur POST aus Notion akzeptieren
+    // Wir erwarten POST von Notion
     if (req.method !== "POST") {
       return res.status(405).json({ error: "Method not allowed" });
     }
@@ -14,17 +14,7 @@ module.exports = async (req, res) => {
       return res.status(500).json({ error: "Missing NOTION env vars" });
     }
 
-    // Secret-Check (falls gesetzt)
-    const expectedSecret = process.env.ELO_WEBHOOK_SECRET;
-    if (expectedSecret) {
-      const incoming = req.headers["x-elo-secret"];
-      if (incoming !== expectedSecret) {
-        console.warn("Unauthorized request: wrong X-ELO-SECRET");
-        return res.status(401).json({ error: "unauthorized" });
-      }
-    }
-
-    // Body robust parsen (Notion schickt JSON)
+    // Body robust parsen
     let body = req.body;
     if (typeof body === "string") {
       try {
@@ -35,10 +25,10 @@ module.exports = async (req, res) => {
     }
     body = body || {};
 
-    // pageId aus verschiedenen möglichen Feldern holen
+    // pageId aus typischen Notion-Payload-Feldern holen
     let pageId =
-      body.page_id || // falls wir später doch explizit senden
-      body.entity?.id || // z.B. laut Kestra-Doku
+      body.page_id ||
+      body.entity?.id ||
       body.data?.id ||
       body.data?.entity?.id ||
       body.page?.id;
@@ -52,16 +42,22 @@ module.exports = async (req, res) => {
     const match = await notion.pages.retrieve({ page_id: pageId });
     const p = match.properties;
 
+    // Status-Property finden (Ergebnis / Status Ergebnis)
     const statusProp = p["Ergebnis"] || p["Status Ergebnis"];
-    const statusName = statusProp?.status?.name;
+    const statusName = (statusProp && statusProp.status && statusProp.status.name) || "";
 
-    // Nur verarbeiten, wenn Status = "Offen"
-    if (statusName !== "Offen") {
-      return res.status(200).json({ message: "Match not open, nothing to do" });
+    // Welche Statusnamen gelten als "offen"?
+    const openStatuses = ["Offen", "To-do", "Todo", "Not started"];
+    const isOpen = openStatuses.includes(statusName);
+
+    if (!isOpen) {
+      // Match ist nicht offen -> nichts tun
+      return res.status(200).json({ message: `Match not open (status=${statusName}), nothing to do` });
     }
 
     const relA = p["Spieler A"]?.relation || [];
     const relB = p["Spieler B"]?.relation || [];
+
     if (relA.length !== 1 || relB.length !== 1) {
       console.error("Spieler A/B Relation invalid:", relA.length, relB.length);
       return res.status(400).json({ error: "Spieler A/B müssen genau 1 Relation haben" });
@@ -108,6 +104,9 @@ module.exports = async (req, res) => {
     const newEloA = Math.round(eloA + K * (scoreA - expectedA));
     const newEloB = Math.round(eloB + K * (scoreB - expectedB));
 
+    // Name der Status-Property bestimmen
+    const statusPropertyName = p["Ergebnis"] ? "Ergebnis" : "Status Ergebnis";
+
     // Updates in Notion schreiben
     await Promise.all([
       notion.pages.update({
@@ -130,7 +129,7 @@ module.exports = async (req, res) => {
           "ELO A nach": { number: newEloA },
           "ELO B nach": { number: newEloB },
           "K": { number: K },
-          "Ergebnis": { status: { name: "Gewertet" } }
+          [statusPropertyName]: { status: { name: "Complete" } }
         }
       })
     ]);
