@@ -56,12 +56,16 @@ module.exports = async (req, res) => {
     }
 
     const relA = p["Spieler A"]?.relation || [];
-    const relB = p["Spieler B"]?.relation || [];
+const relB = p["Spieler B"]?.relation || [];
 
-    if (relA.length !== 1 || relB.length !== 1) {
-      console.error("Spieler A/B Relation invalid:", relA.length, relB.length);
-      return res.status(400).json({ error: "Spieler A/B müssen genau 1 Relation haben" });
-    }
+// Wenn Relationen nicht sauber sind, loggen wir nur – kein harter Fehler
+if (relA.length !== 1 || relB.length !== 1) {
+  console.warn("Spieler A/B Relation invalid:", relA.length, relB.length);
+  return res.status(200).json({
+    message: `Match skipped – Spieler A/B Relation invalid: ${relA.length} ${relB.length}`
+  });
+}
+
 
     const playerAId = relA[0].id;
     const playerBId = relB[0].id;
