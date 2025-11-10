@@ -4,29 +4,72 @@ const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
 module.exports = async (req, res) => {
   try {
+    // Nur POST aus Notion akzeptieren
+    if (req.method !== "POST") {
+      return res.status(405).json({ error: "Method not allowed" });
+    }
+
     if (!process.env.NOTION_TOKEN || !process.env.PLAYERS_DB_ID || !process.env.MATCHES_DB_ID) {
+      console.error("Missing NOTION env vars");
       return res.status(500).json({ error: "Missing NOTION env vars" });
     }
 
-    let pageId = req.method === "GET" ? req.query.page_id : req.body?.page_id;
-    if (!pageId) return res.status(400).json({ error: "Missing page_id" });
-
-    if (process.env.ELO_WEBHOOK_SECRET) {
+    // Secret-Check (falls gesetzt)
+    const expectedSecret = process.env.ELO_WEBHOOK_SECRET;
+    if (expectedSecret) {
       const incoming = req.headers["x-elo-secret"];
-      if (incoming !== process.env.ELO_WEBHOOK_SECRET) return res.status(401).json({ error: "Unauthorized" });
+      if (incoming !== expectedSecret) {
+        console.warn("Unauthorized request: wrong X-ELO-SECRET");
+        return res.status(401).json({ error: "unauthorized" });
+      }
     }
 
+    // Body robust parsen (Notion schickt JSON)
+    let body = req.body;
+    if (typeof body === "string") {
+      try {
+        body = JSON.parse(body);
+      } catch {
+        body = {};
+      }
+    }
+    body = body || {};
+
+    // pageId aus verschiedenen möglichen Feldern holen
+    let pageId =
+      body.page_id || // falls wir später doch explizit senden
+      body.entity?.id || // z.B. laut Kestra-Doku
+      body.data?.id ||
+      body.data?.entity?.id ||
+      body.page?.id;
+
+    if (!pageId) {
+      console.error("Could not determine page_id from payload:", JSON.stringify(body));
+      return res.status(400).json({ error: "Missing page_id in payload" });
+    }
+
+    // Match-Seite holen
     const match = await notion.pages.retrieve({ page_id: pageId });
     const p = match.properties;
-    const status = p["Ergebnis"]?.status?.name;
-    if (status !== "Offen") return res.status(200).json({ message: "Match already processed or not open" });
+
+    const statusProp = p["Ergebnis"] || p["Status Ergebnis"];
+    const statusName = statusProp?.status?.name;
+
+    // Nur verarbeiten, wenn Status = "Offen"
+    if (statusName !== "Offen") {
+      return res.status(200).json({ message: "Match not open, nothing to do" });
+    }
 
     const relA = p["Spieler A"]?.relation || [];
     const relB = p["Spieler B"]?.relation || [];
-    if (relA.length !== 1 || relB.length !== 1)
+    if (relA.length !== 1 || relB.length !== 1) {
+      console.error("Spieler A/B Relation invalid:", relA.length, relB.length);
       return res.status(400).json({ error: "Spieler A/B müssen genau 1 Relation haben" });
+    }
 
-    const [playerAId, playerBId] = [relA[0].id, relB[0].id];
+    const playerAId = relA[0].id;
+    const playerBId = relB[0].id;
+
     const [playerA, playerB] = await Promise.all([
       notion.pages.retrieve({ page_id: playerAId }),
       notion.pages.retrieve({ page_id: playerBId })
@@ -34,23 +77,51 @@ module.exports = async (req, res) => {
 
     const eloA = playerA.properties["ELO"].number ?? 1000;
     const eloB = playerB.properties["ELO"].number ?? 1000;
-    const goalsA = p["Tore A"].number, goalsB = p["Tore B"].number;
-    if (typeof goalsA !== "number" || typeof goalsB !== "number")
+
+    const goalsA = p["Tore A"]?.number;
+    const goalsB = p["Tore B"]?.number;
+
+    if (typeof goalsA !== "number" || typeof goalsB !== "number") {
+      console.error("Tore sind keine Zahlen:", goalsA, goalsB);
       return res.status(400).json({ error: "Tore A/B müssen Zahlen sein" });
+    }
 
-    let scoreA = 0.5, scoreB = 0.5;
-    if (goalsA > goalsB) [scoreA, scoreB] = [1, 0];
-    else if (goalsA < goalsB) [scoreA, scoreB] = [0, 1];
+    // Ergebnis in 1 / 0.5 / 0 mappen
+    let scoreA = 0.5;
+    let scoreB = 0.5;
+    if (goalsA > goalsB) {
+      scoreA = 1;
+      scoreB = 0;
+    } else if (goalsA < goalsB) {
+      scoreA = 0;
+      scoreB = 1;
+    }
 
-    const K = p["K"]?.number || 20;
+    // K lesen (oder Default 20)
+    const kProp = p["K"];
+    const K = (kProp && typeof kProp.number === "number" ? kProp.number : 20);
+
+    // ELO-Formel
     const expectedA = 1 / (1 + Math.pow(10, (eloB - eloA) / 400));
     const expectedB = 1 / (1 + Math.pow(10, (eloA - eloB) / 400));
+
     const newEloA = Math.round(eloA + K * (scoreA - expectedA));
     const newEloB = Math.round(eloB + K * (scoreB - expectedB));
 
+    // Updates in Notion schreiben
     await Promise.all([
-      notion.pages.update({ page_id: playerAId, properties: { "ELO": { number: newEloA } } }),
-      notion.pages.update({ page_id: playerBId, properties: { "ELO": { number: newEloB } } }),
+      notion.pages.update({
+        page_id: playerAId,
+        properties: {
+          "ELO": { number: newEloA }
+        }
+      }),
+      notion.pages.update({
+        page_id: playerBId,
+        properties: {
+          "ELO": { number: newEloB }
+        }
+      }),
       notion.pages.update({
         page_id: pageId,
         properties: {
@@ -66,6 +137,7 @@ module.exports = async (req, res) => {
 
     return res.status(200).json({
       message: "ELO updated",
+      pageId,
       playerA: { old: eloA, new: newEloA },
       playerB: { old: eloB, new: newEloB }
     });
